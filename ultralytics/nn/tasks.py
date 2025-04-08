@@ -306,18 +306,9 @@ class BaseModel(torch.nn.Module):
 class DetectionModel(BaseModel):
     """YOLO detection model."""
 
-    def __init__(self, cfg="yolo11n.yaml", ch=3, nc=None, verbose=True):  # model, input channels, number of classes
-        """
-        Initialize the YOLO detection model with the given config and parameters.
-
-        Args:
-            cfg (str | dict): Model configuration file path or dictionary.
-            ch (int): Number of input channels.
-            nc (int, optional): Number of classes.
-            verbose (bool): Whether to display model information.
-        """
+    def __init__(self, cfg="yolo11n.yaml", ch=3, nc=None, verbose=True):
         super().__init__()
-        self.yaml = cfg if isinstance(cfg, dict) else yaml_model_load(cfg)  # cfg dict
+        self.yaml = cfg if isinstance(cfg, dict) else yaml_model_load(cfg)
         if self.yaml["backbone"][0][2] == "Silence":
             LOGGER.warning(
                 "WARNING ⚠️ YOLOv9 `Silence` module is deprecated in favor of torch.nn.Identity. "
@@ -325,110 +316,90 @@ class DetectionModel(BaseModel):
             )
             self.yaml["backbone"][0][2] = "nn.Identity"
 
-        # Define model
-        ch = self.yaml["ch"] = self.yaml.get("ch", ch)  # input channels
+        ch = self.yaml["ch"] = self.yaml.get("ch", ch)
         if nc and nc != self.yaml["nc"]:
             LOGGER.info(f"Overriding model.yaml nc={self.yaml['nc']} with nc={nc}")
-            self.yaml["nc"] = nc  # override YAML value
-        self.model, self.save = parse_model(deepcopy(self.yaml), ch=ch, verbose=verbose)  # model, savelist
-        self.names = {i: f"{i}" for i in range(self.yaml["nc"])}  # default names dict
+            self.yaml["nc"] = nc
+
+        self.model, self.save = parse_model(deepcopy(self.yaml), ch=ch, verbose=verbose)
+        self.names = {i: f"{i}" for i in range(self.yaml["nc"])}
         self.inplace = self.yaml.get("inplace", True)
         self.end2end = getattr(self.model[-1], "end2end", False)
 
         # Build strides
-        m = self.model[-1]  # Detect()
-        if isinstance(m, Detect):  # includes all Detect subclasses like Segment, Pose, OBB, YOLOEDetect, YOLOESegment
-            s = 256  # 2x min stride
-            m.inplace = self.inplace
+        m = self.model[-1]
+        if isinstance(m, Detect):
+            s = 256
 
             def _forward(x):
-                """Perform a forward pass through the model, handling different Detect subclass types accordingly."""
                 if self.end2end:
                     return self.forward(x)["one2many"]
                 return self.forward(x)[0] if isinstance(m, (Segment, YOLOESegment, Pose, OBB)) else self.forward(x)
 
-            m.stride = torch.tensor([s / x.shape[-2] for x in _forward(torch.zeros(1, ch, s, s))])  # forward
+            m.stride = torch.tensor([s / x.shape[-2] for x in _forward(torch.zeros(1, ch, s, s))])
             self.stride = m.stride
-            m.bias_init()  # only run once
+            m.bias_init()
         else:
-            self.stride = torch.Tensor([32])  # default stride for i.e. RTDETR
+            self.stride = torch.Tensor([32])  # RT-DETR etc.
 
-        # Init weights, biases
         initialize_weights(self)
         if verbose:
             self.info()
             LOGGER.info("")
 
+    def forward(self, x):
+        """Modified forward method to support RT-DETR-like transformer heads."""
+        y = []
+        for m in self.model:
+            if isinstance(m, Detect):
+                return m(x)  # normal Detect head
+            elif isinstance(m, RTDETRDecoder):  # Custom Transformer-based decoder
+                return m(x, self.model.fpn_outs)  # assuming fpn_outs is set by the neck
+            else:
+                x = m(x)
+                if hasattr(m, "save") and m.save:
+                    y.append(x)
+        return x
+
     def _predict_augment(self, x):
-        """
-        Perform augmentations on input image x and return augmented inference and train outputs.
-
-        Args:
-            x (torch.Tensor): Input image tensor.
-
-        Returns:
-            (torch.Tensor): Augmented inference output.
-        """
         if getattr(self, "end2end", False) or self.__class__.__name__ != "DetectionModel":
             LOGGER.warning("WARNING ⚠️ Model does not support 'augment=True', reverting to single-scale prediction.")
             return self._predict_once(x)
-        img_size = x.shape[-2:]  # height, width
-        s = [1, 0.83, 0.67]  # scales
-        f = [None, 3, None]  # flips (2-ud, 3-lr)
-        y = []  # outputs
+        img_size = x.shape[-2:]
+        s = [1, 0.83, 0.67]
+        f = [None, 3, None]
+        y = []
         for si, fi in zip(s, f):
             xi = scale_img(x.flip(fi) if fi else x, si, gs=int(self.stride.max()))
-            yi = super().predict(xi)[0]  # forward
+            yi = super().predict(xi)[0]
             yi = self._descale_pred(yi, fi, si, img_size)
             y.append(yi)
-        y = self._clip_augmented(y)  # clip augmented tails
-        return torch.cat(y, -1), None  # augmented inference, train
+        y = self._clip_augmented(y)
+        return torch.cat(y, -1), None
 
     @staticmethod
     def _descale_pred(p, flips, scale, img_size, dim=1):
-        """
-        De-scale predictions following augmented inference (inverse operation).
-
-        Args:
-            p (torch.Tensor): Predictions tensor.
-            flips (int): Flip type (0=none, 2=ud, 3=lr).
-            scale (float): Scale factor.
-            img_size (tuple): Original image size (height, width).
-            dim (int): Dimension to split at.
-
-        Returns:
-            (torch.Tensor): De-scaled predictions.
-        """
-        p[:, :4] /= scale  # de-scale
+        p[:, :4] /= scale
         x, y, wh, cls = p.split((1, 1, 2, p.shape[dim] - 4), dim)
         if flips == 2:
-            y = img_size[0] - y  # de-flip ud
+            y = img_size[0] - y
         elif flips == 3:
-            x = img_size[1] - x  # de-flip lr
+            x = img_size[1] - x
         return torch.cat((x, y, wh, cls), dim)
 
     def _clip_augmented(self, y):
-        """
-        Clip YOLO augmented inference tails.
-
-        Args:
-            y (List[torch.Tensor]): List of detection tensors.
-
-        Returns:
-            (List[torch.Tensor]): Clipped detection tensors.
-        """
-        nl = self.model[-1].nl  # number of detection layers (P3-P5)
-        g = sum(4**x for x in range(nl))  # grid points
-        e = 1  # exclude layer count
-        i = (y[0].shape[-1] // g) * sum(4**x for x in range(e))  # indices
-        y[0] = y[0][..., :-i]  # large
-        i = (y[-1].shape[-1] // g) * sum(4 ** (nl - 1 - x) for x in range(e))  # indices
-        y[-1] = y[-1][..., i:]  # small
+        nl = self.model[-1].nl
+        g = sum(4**x for x in range(nl))
+        e = 1
+        i = (y[0].shape[-1] // g) * sum(4**x for x in range(e))
+        y[0] = y[0][..., :-i]
+        i = (y[-1].shape[-1] // g) * sum(4 ** (nl - 1 - x) for x in range(e))
+        y[-1] = y[-1][..., i:]
         return y
 
     def init_criterion(self):
-        """Initialize the loss criterion for the DetectionModel."""
         return E2EDetectLoss(self) if getattr(self, "end2end", False) else v8DetectionLoss(self)
+
 
 
 class OBBModel(DetectionModel):
