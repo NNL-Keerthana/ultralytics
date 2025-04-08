@@ -12,6 +12,7 @@ from .conv import Conv
 from .utils import _get_clones, inverse_sigmoid, multi_scale_deformable_attn_pytorch
 
 __all__ = (
+    "SimpleTransformer"
     "TransformerEncoderLayer",
     "TransformerLayer",
     "TransformerBlock",
@@ -24,6 +25,15 @@ __all__ = (
     "MLP",
 )
 
+class SimpleTransformer(nn.Module):
+    def __init__(self, d_model=256, nhead=8, num_encoder_layers=6):
+        super().__init__()
+        encoder_layer = nn.TransformerEncoderLayer(d_model=d_model, nhead=nhead)
+        self.encoder = nn.TransformerEncoder(encoder_layer, num_layers=num_encoder_layers)
+
+    def forward(self, src, query):
+        memory = self.encoder(src)
+        return memory + query
 
 class TransformerEncoderLayer(nn.Module):
     """
