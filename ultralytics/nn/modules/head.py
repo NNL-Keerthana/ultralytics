@@ -7,6 +7,7 @@ import math
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from ultralytics.nn.transformer import SimpleTransformer
 from torch.nn.init import constant_, xavier_uniform_
 
 from ultralytics.utils.tal import TORCH_1_10, dist2bbox, dist2rbox, make_anchors
@@ -17,7 +18,35 @@ from .conv import Conv, DWConv
 from .transformer import MLP, DeformableTransformerDecoder, DeformableTransformerDecoderLayer
 from .utils import bias_init_with_prob, linear_init
 
-__all__ = "Detect", "Segment", "Pose", "Classify", "OBB", "RTDETRDecoder", "v10Detect", "YOLOEDetect", "YOLOESegment"
+__all__ = "Detect", "Segment", "Pose", "Classify", "OBB", "RTDETRDecoder", "v10Detect", "YOLOEDetect", "YOLOESegment", "RTDETR"
+
+class RTDETR(nn.Module):
+    def __init__(self, in_channels, num_classes=10, num_queries=100):
+        super().__init__()
+        self.num_queries = num_queries
+        self.input_proj = nn.ModuleList([
+            nn.Conv2d(c, 256, kernel_size=1) for c in in_channels
+        ])
+
+        self.transformer = SimpleTransformer(d_model=256, nhead=8, num_encoder_layers=6)
+        self.query_embed = nn.Embedding(num_queries, 256)
+        self.class_embed = nn.Linear(256, num_classes)
+        self.bbox_embed = nn.Linear(256, 4)
+
+    def forward(self, x):
+        x = [proj(feat) for feat, proj in zip(x, self.input_proj)]
+        bs, _, _, _ = x[0].shape
+        x_cat = torch.cat([
+            F.interpolate(f, size=x[0].shape[-2:], mode="nearest") for f in x
+        ], dim=1)
+
+        x_flat = x_cat.flatten(2).permute(2, 0, 1)
+        queries = self.query_embed.weight.unsqueeze(1).repeat(1, bs, 1)
+        hs = self.transformer(x_flat, queries)
+
+        outputs_class = self.class_embed(hs)
+        outputs_coord = self.bbox_embed(hs).sigmoid()
+        return {'logits': outputs_class[-1], 'boxes': outputs_coord[-1]}
 
 
 class Detect(nn.Module):
